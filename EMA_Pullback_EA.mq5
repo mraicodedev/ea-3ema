@@ -35,8 +35,7 @@ input group "=== Pattern Detection ==="
 input double           InpPinbarRatio    = 2.0;             // Pinbar: wick/body minimum ratio
 input double           InpMinCandleRange = 1.0;             // Min candle range to qualify (price $)
 
-input group "=== Export Settings ==="
-input string           InpExportFileName = "EMA_Pullback_History.csv"; // CSV File Name (in MQL5/Files)
+
 
 input group "=== Trading Days ==="
 input bool             InpTradeMonday    = true;            // Trade on Monday
@@ -83,6 +82,7 @@ ENUM_DIR g_direction = DIR_NONE;
 bool     g_setupValid = false;
 SLevel   g_lvFast, g_lvMid, g_lvSlow;
 datetime g_lastBarTime = 0;
+string   g_exportFileName = "";
 
 //+------------------------------------------------------------------+
 //| Calculate lot size so that SL = exactly $InpRiskPerTrade          |
@@ -105,8 +105,8 @@ double CalcLotSize(double slDistancePrice)
 
    double lots = InpRiskPerTrade / lossPerLot;
 
-   // Round down to lot step
-   lots = MathFloor(lots / lotStep) * lotStep;
+   // Round to nearest lot step (MathRound for accuracy, not MathFloor)
+   lots = MathRound(lots / lotStep) * lotStep;
 
    // If lot < minimum (0.01), skip this trade to protect risk
    if(lots < minLot)
@@ -119,7 +119,10 @@ double CalcLotSize(double slDistancePrice)
    }
 
    lots = MathMin(lots, maxLot);
-   return NormalizeDouble(lots, 2);
+
+   // Calculate precision from lotStep (e.g. 0.01 -> 2, 0.001 -> 3)
+   int lotDigits = (int)MathMax(-MathLog10(lotStep), 0);
+   return NormalizeDouble(lots, lotDigits);
 }
 
 //+------------------------------------------------------------------+
@@ -282,15 +285,14 @@ bool IsTradingDayAllowed()
 //+------------------------------------------------------------------+
 //| Open BUY                                                          |
 //+------------------------------------------------------------------+
-bool OpenBuy(double sl, double tp, double lots, string comment, ulong &ticket)
+bool OpenBuy(double sl, double tp, double lots, string comment, ulong &ticket, double entryPrice)
 {
    if(!IsTradingDayAllowed())
       return false;
 
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    sl = NP(sl); tp = NP(tp);
    if(lots <= 0) { return false; }
-   if(g_trade.Buy(lots, _Symbol, ask, sl, tp, comment))
+   if(g_trade.Buy(lots, _Symbol, entryPrice, sl, tp, comment))
    {
       ticket = g_trade.ResultOrder();
       return true;
@@ -302,15 +304,14 @@ bool OpenBuy(double sl, double tp, double lots, string comment, ulong &ticket)
 //+------------------------------------------------------------------+
 //| Open SELL                                                         |
 //+------------------------------------------------------------------+
-bool OpenSell(double sl, double tp, double lots, string comment, ulong &ticket)
+bool OpenSell(double sl, double tp, double lots, string comment, ulong &ticket, double entryPrice)
 {
    if(!IsTradingDayAllowed())
       return false;
 
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    sl = NP(sl); tp = NP(tp);
    if(lots <= 0) { return false; }
-   if(g_trade.Sell(lots, _Symbol, bid, sl, tp, comment))
+   if(g_trade.Sell(lots, _Symbol, entryPrice, sl, tp, comment))
    {
       ticket = g_trade.ResultOrder();
       return true;
@@ -379,7 +380,7 @@ void ExportTradeToCSV(ulong ticket)
    double finalProfit = profit + commission + swap;
    long duration = (timeIn > 0) ? (long)(timeOut - timeIn) : 0;
 
-   int fileHandle = FileOpen(InpExportFileName, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
+   int fileHandle = FileOpen(g_exportFileName, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
    if(fileHandle != INVALID_HANDLE)
    {
       FileSeek(fileHandle, 0, SEEK_END);
@@ -491,7 +492,7 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
             double tp   = NP(ask + risk * rrMultiple);
             double lots = CalcLotSize(risk);
 
-            if(risk > 0 && OpenBuy(sl, tp, lots, label, lv.ticket))
+            if(risk > 0 && OpenBuy(sl, tp, lots, label, lv.ticket, ask))
             {
                lv.state = LV_DONE;
             }
@@ -510,7 +511,7 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
          double tp   = NP(ask + risk * rrMultiple);
          double lots = CalcLotSize(risk);
 
-         if(risk > 0 && OpenBuy(sl, tp, lots, label, lv.ticket))
+         if(risk > 0 && OpenBuy(sl, tp, lots, label, lv.ticket, ask))
          {
             lv.state = LV_DONE;
          }
@@ -547,7 +548,7 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
             double tp   = NP(bid - risk * rrMultiple);
             double lots = CalcLotSize(risk);
 
-            if(risk > 0 && OpenSell(sl, tp, lots, label, lv.ticket))
+            if(risk > 0 && OpenSell(sl, tp, lots, label, lv.ticket, bid))
             {
                lv.state = LV_DONE;
             }
@@ -566,7 +567,7 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
          double tp   = NP(bid - risk * rrMultiple);
          double lots = CalcLotSize(risk);
 
-         if(risk > 0 && OpenSell(sl, tp, lots, label, lv.ticket))
+         if(risk > 0 && OpenSell(sl, tp, lots, label, lv.ticket, bid))
          {
             lv.state = LV_DONE;
          }
@@ -596,6 +597,11 @@ int OnInit()
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpSlippage);
    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   // Auto-generate export filename: e.g. BTCUSD_M15.csv
+   string tf = EnumToString((ENUM_TIMEFRAMES)Period());
+   StringReplace(tf, "PERIOD_", "");
+   g_exportFileName = _Symbol + "_" + tf + ".csv";
 
    ResetState();
    return INIT_SUCCEEDED;
