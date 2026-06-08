@@ -3,10 +3,10 @@
 //|                                          Copyright 2026, TamPV   |
 //+------------------------------------------------------------------+
 #property copyright "TamPV"
-#property version   "2.00"
+#property version   "3.00"
 #property description "3 EMA Pullback + Price Action Confirmation"
 #property description "Entry: Touch EMA -> Wait Pinbar/Engulfing -> Enter"
-#property description "SL: Below/Above candle cluster wick + buffer"
+#property description "SL: Below/Above EMA Slow (Fast/Mid) or confirmation candle (Slow)"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -20,11 +20,13 @@ input int              InpPeriodMid      = 89;              // EMA Mid Period
 input int              InpPeriodSlow     = 200;             // EMA Slow Period
 
 input group "=== Trade Settings ==="
-input bool             InpUseEMA34       = true;            // Enable Entry at EMA34
-input bool             InpUseEMA89       = true;            // Enable Entry at EMA89
-input bool             InpUseEMA200      = true;            // Enable Entry at EMA200
+input bool             InpUseEMA_Fast    = true;            // Enable Entry at Fast EMA
+input bool             InpUseEMA_Mid     = true;            // Enable Entry at Mid EMA
+input bool             InpUseEMA_Slow    = true;            // Enable Entry at Slow EMA
+input double           InpRR_Fast        = 1.0;             // R:R Ratio for Fast EMA (Level 1)
+input double           InpRR_Mid         = 2.0;             // R:R Ratio for Mid EMA (Level 2)
+input double           InpRR_Slow        = 3.0;             // R:R Ratio for Slow EMA (Level 3)
 input double           InpRiskPerTrade   = 50.0;            // Risk per trade ($)
-input double           InpSL_Buffer      = 3.0;             // SL Buffer beyond candle wick (price $)
 input int              InpMaxWaitBars    = 5;               // Max bars to wait for confirmation
 input int              InpMagicNumber    = 345890;          // Magic Number
 input int              InpSlippage       = 30;              // Slippage (points)
@@ -35,6 +37,15 @@ input double           InpMinCandleRange = 1.0;             // Min candle range 
 
 input group "=== Export Settings ==="
 input string           InpExportFileName = "EMA_Pullback_History.csv"; // CSV File Name (in MQL5/Files)
+
+input group "=== Trading Days ==="
+input bool             InpTradeMonday    = true;            // Trade on Monday
+input bool             InpTradeTuesday   = true;            // Trade on Tuesday
+input bool             InpTradeWednesday = true;            // Trade on Wednesday
+input bool             InpTradeThursday  = true;            // Trade on Thursday
+input bool             InpTradeFriday    = true;            // Trade on Friday
+input bool             InpTradeSaturday  = false;           // Trade on Saturday
+input bool             InpTradeSunday    = false;           // Trade on Sunday
 
 //+------------------------------------------------------------------+
 //| Enums & Structures                                                |
@@ -52,16 +63,12 @@ struct SLevel
 {
    ENUM_LV_STATE state;
    int           waitBars;      // Bars waited since touch
-   double        clusterLow;    // Lowest low in candle cluster (BUY SL ref)
-   double        clusterHigh;   // Highest high in candle cluster (SELL SL ref)
    ulong         ticket;        // Position ticket
 
    void Init()
    {
       state       = LV_WAIT_TOUCH;
       waitBars    = 0;
-      clusterLow  = DBL_MAX;
-      clusterHigh = 0;
       ticket      = 0;
    }
 };
@@ -69,12 +76,12 @@ struct SLevel
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
-int g_hEMA34, g_hEMA89, g_hEMA200;
+int g_hEMA_Fast, g_hEMA_Mid, g_hEMA_Slow;
 CTrade g_trade;
 
 ENUM_DIR g_direction = DIR_NONE;
 bool     g_setupValid = false;
-SLevel   g_lv34, g_lv89, g_lv200;
+SLevel   g_lvFast, g_lvMid, g_lvSlow;
 datetime g_lastBarTime = 0;
 
 //+------------------------------------------------------------------+
@@ -234,7 +241,6 @@ void CloseAllPositions()
          && PositionGetString(POSITION_SYMBOL) == _Symbol)
       {
          g_trade.PositionClose(ticket);
-         Print("Closed position #", ticket);
       }
    }
 }
@@ -247,10 +253,30 @@ void ResetState()
    g_direction  = DIR_NONE;
    g_setupValid = false;
    g_lastBarTime = 0;
-   g_lv34.Init();
-   g_lv89.Init();
-   g_lv200.Init();
-   Print("=== State Reset - New monitoring cycle ===");
+   g_lvFast.Init();
+   g_lvMid.Init();
+   g_lvSlow.Init();
+}
+
+//+------------------------------------------------------------------+
+//| Check if trading is allowed on the current day of the week        |
+//+------------------------------------------------------------------+
+bool IsTradingDayAllowed()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   
+   switch(dt.day_of_week)
+   {
+      case 0: return InpTradeSunday;
+      case 1: return InpTradeMonday;
+      case 2: return InpTradeTuesday;
+      case 3: return InpTradeWednesday;
+      case 4: return InpTradeThursday;
+      case 5: return InpTradeFriday;
+      case 6: return InpTradeSaturday;
+   }
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -258,13 +284,15 @@ void ResetState()
 //+------------------------------------------------------------------+
 bool OpenBuy(double sl, double tp, double lots, string comment, ulong &ticket)
 {
+   if(!IsTradingDayAllowed())
+      return false;
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    sl = NP(sl); tp = NP(tp);
-   if(lots <= 0) { Print("BUY SKIP: ", comment, " lot=0"); return false; }
+   if(lots <= 0) { return false; }
    if(g_trade.Buy(lots, _Symbol, ask, sl, tp, comment))
    {
       ticket = g_trade.ResultOrder();
-      Print("BUY: ", comment, " #", ticket, " Lot=", lots, " @", ask, " SL=", sl, " TP=", tp);
       return true;
    }
    Print("BUY FAILED: ", comment, " Lot=", lots, " Err=", GetLastError());
@@ -276,13 +304,15 @@ bool OpenBuy(double sl, double tp, double lots, string comment, ulong &ticket)
 //+------------------------------------------------------------------+
 bool OpenSell(double sl, double tp, double lots, string comment, ulong &ticket)
 {
+   if(!IsTradingDayAllowed())
+      return false;
+
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    sl = NP(sl); tp = NP(tp);
-   if(lots <= 0) { Print("SELL SKIP: ", comment, " lot=0"); return false; }
+   if(lots <= 0) { return false; }
    if(g_trade.Sell(lots, _Symbol, bid, sl, tp, comment))
    {
       ticket = g_trade.ResultOrder();
-      Print("SELL: ", comment, " #", ticket, " Lot=", lots, " @", bid, " SL=", sl, " TP=", tp);
       return true;
    }
    Print("SELL FAILED: ", comment, " Lot=", lots, " Err=", GetLastError());
@@ -331,18 +361,16 @@ void ExportTradeToCSV(ulong ticket)
    }
 
    // Lấy SL/TP từ lịch sử Order (vì Position đã đóng)
-   if(HistorySelect(timeIn, timeOut + 1))
+   // Do HistorySelectByPosition(ticket) đã được chọn ở trên, các orders liên quan đều có sẵn
+   int totalOrders = HistoryOrdersTotal();
+   for(int i = 0; i < totalOrders; i++)
    {
-      int totalOrders = HistoryOrdersTotal();
-      for(int i = 0; i < totalOrders; i++)
+      ulong o = HistoryOrderGetTicket(i);
+      if(HistoryOrderGetInteger(o, ORDER_POSITION_ID) == (long)ticket)
       {
-         ulong o = HistoryOrderGetTicket(i);
-         if(HistoryOrderGetInteger(o, ORDER_POSITION_ID) == (long)ticket)
-         {
-            sl = HistoryOrderGetDouble(o, ORDER_SL);
-            tp = HistoryOrderGetDouble(o, ORDER_TP);
-            break;
-         }
+         sl = HistoryOrderGetDouble(o, ORDER_SL);
+         tp = HistoryOrderGetDouble(o, ORDER_TP);
+         if(sl > 0 || tp > 0) break;
       }
    }
 
@@ -351,30 +379,32 @@ void ExportTradeToCSV(ulong ticket)
    double finalProfit = profit + commission + swap;
    long duration = (timeIn > 0) ? (long)(timeOut - timeIn) : 0;
 
-   int fileHandle = FileOpen(InpExportFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI);
+   int fileHandle = FileOpen(InpExportFileName, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI);
    if(fileHandle != INVALID_HANDLE)
    {
       FileSeek(fileHandle, 0, SEEK_END);
       if(FileSize(fileHandle) == 0)
       {
          // Ghi header nếu file mới
-         FileWrite(fileHandle, "TimeIn", "Type", "Profit", "SL", "TP", "Symbol", "Timeframe", "Duration(s)", "Comment/Magic");
+         string header = "\"TimeIn\",\"Type\",\"Volume\",\"Profit\",\"SL\",\"TP\",\"Symbol\",\"Timeframe\",\"Duration(s)\",\"EMA\",\"Magic\"";
+         FileWriteString(fileHandle, header + "\r\n");
       }
       
-      // Ghi dữ liệu
-      FileWrite(fileHandle, 
-                TimeToString(timeIn, TIME_DATE|TIME_MINUTES|TIME_SECONDS),
-                type, 
-                DoubleToString(finalProfit, 2), 
-                DoubleToString(sl, _Digits), 
-                DoubleToString(tp, _Digits), 
-                symbol, 
-                timeframe, 
-                IntegerToString(duration), 
-                comment + "/" + IntegerToString(InpMagicNumber));
+      // Ghi dữ liệu - các cột ngăn cách bằng dấu phẩy, giá trị bọc trong ngoặc kép
+      string line = "\"" + TimeToString(timeIn, TIME_DATE|TIME_MINUTES|TIME_SECONDS) + "\","
+                  + "\"" + type + "\","
+                  + "\"" + DoubleToString(lots, 2) + "\","
+                  + "\"" + DoubleToString(finalProfit, 2) + "\","
+                  + "\"" + DoubleToString(sl, _Digits) + "\","
+                  + "\"" + DoubleToString(tp, _Digits) + "\","
+                  + "\"" + symbol + "\","
+                  + "\"" + timeframe + "\","
+                  + "\"" + IntegerToString(duration) + "\","
+                  + "\"" + comment + "\","
+                  + "\"" + IntegerToString(InpMagicNumber) + "\"";
+      FileWriteString(fileHandle, line + "\r\n");
                 
       FileClose(fileHandle);
-      Print(">>> Đã ghi lịch sử lệnh #", ticket, " vào file: MQL5\\Files\\", InpExportFileName);
    }
    else
    {
@@ -415,14 +445,23 @@ int GetPositionClosureState(ulong ticket)
 //+------------------------------------------------------------------+
 bool AllPositionsClosed()
 {
-   bool anyEntry = (g_lv34.state == LV_DONE || g_lv89.state == LV_DONE || g_lv200.state == LV_DONE);
+   bool anyEntry = (g_lvFast.state == LV_DONE || g_lvMid.state == LV_DONE || g_lvSlow.state == LV_DONE);
    if(!anyEntry) return false;
 
-   bool has34  = PositionExists(g_lv34.ticket);
-   bool has89  = PositionExists(g_lv89.ticket);
-   bool has200 = PositionExists(g_lv200.ticket);
+   // Check if any entered position is still active
+   if(g_lvFast.state == LV_DONE && PositionExists(g_lvFast.ticket)) return false;
+   if(g_lvMid.state == LV_DONE && PositionExists(g_lvMid.ticket)) return false;
+   if(g_lvSlow.state == LV_DONE && PositionExists(g_lvSlow.ticket)) return false;
 
-   return (anyEntry && !has34 && !has89 && !has200);
+   // If setup invalid (e.g. EMA alignment broken), reset when all entered positions closed
+   if(!g_setupValid) return true;
+
+   // If setup still valid, wait for all enabled levels to complete
+   if(InpUseEMA_Fast && g_lvFast.state != LV_DONE) return false;
+   if(InpUseEMA_Mid  && g_lvMid.state  != LV_DONE) return false;
+   if(InpUseEMA_Slow && g_lvSlow.state != LV_DONE) return false;
+
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -432,18 +471,17 @@ bool AllPositionsClosed()
 //+------------------------------------------------------------------+
 void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultiple, string label)
 {
-   double barLow  = iLow(_Symbol, PERIOD_CURRENT, 1);
-   double barHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double barLow   = iLow(_Symbol, PERIOD_CURRENT, 1);
+   double barHigh  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double barClose = iClose(_Symbol, PERIOD_CURRENT, 1);
 
    if(lv.state == LV_WAIT_TOUCH)
    {
-      // Check if bar[1] low touched EMA
-      if(barLow <= emaVal)
+      // Check if bar[1] pulled back to touch EMA and closed above it (true pullback)
+      if(barLow <= emaVal && barClose > emaVal)
       {
-         lv.state      = LV_WAIT_CONFIRM;
-         lv.waitBars   = 0;
-         lv.clusterLow = barLow;
-         Print(label, " TOUCHED | Bar Low=", barLow, " EMA=", emaVal);
+         lv.state    = LV_WAIT_CONFIRM;
+         lv.waitBars = 0;
 
          if(HasBullishConfirm(1))
          {
@@ -456,7 +494,6 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
             if(risk > 0 && OpenBuy(sl, tp, lots, label, lv.ticket))
             {
                lv.state = LV_DONE;
-               Print(label, " CONFIRMED (same bar) | Lot=", lots, " SL=", sl, " Risk$=", InpRiskPerTrade, " TP=", tp);
             }
          }
       }
@@ -464,7 +501,6 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
    else if(lv.state == LV_WAIT_CONFIRM)
    {
       lv.waitBars++;
-      lv.clusterLow = MathMin(lv.clusterLow, barLow);
 
       if(HasBullishConfirm(1))
       {
@@ -477,14 +513,11 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
          if(risk > 0 && OpenBuy(sl, tp, lots, label, lv.ticket))
          {
             lv.state = LV_DONE;
-            Print(label, " CONFIRMED (bar ", lv.waitBars, ") | Lot=", lots, " SL=", sl, " Risk$=", InpRiskPerTrade, " TP=", tp);
          }
       }
       else if(lv.waitBars >= InpMaxWaitBars)
       {
-         Print(label, " confirmation timeout after ", lv.waitBars, " bars. Reset touch.");
          lv.state = LV_WAIT_TOUCH;
-         lv.clusterLow = DBL_MAX;
       }
    }
 }
@@ -494,18 +527,17 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
 //+------------------------------------------------------------------+
 void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultiple, string label)
 {
-   double barLow  = iLow(_Symbol, PERIOD_CURRENT, 1);
-   double barHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double barLow   = iLow(_Symbol, PERIOD_CURRENT, 1);
+   double barHigh  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double barClose = iClose(_Symbol, PERIOD_CURRENT, 1);
 
    if(lv.state == LV_WAIT_TOUCH)
    {
-      // Check if bar[1] high touched EMA
-      if(barHigh >= emaVal)
+      // Check if bar[1] pulled back to touch EMA and closed below it (true pullback)
+      if(barHigh >= emaVal && barClose < emaVal)
       {
-         lv.state       = LV_WAIT_CONFIRM;
-         lv.waitBars    = 0;
-         lv.clusterHigh = barHigh;
-         Print(label, " TOUCHED | Bar High=", barHigh, " EMA=", emaVal);
+         lv.state    = LV_WAIT_CONFIRM;
+         lv.waitBars = 0;
 
          if(HasBearishConfirm(1))
          {
@@ -518,7 +550,6 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
             if(risk > 0 && OpenSell(sl, tp, lots, label, lv.ticket))
             {
                lv.state = LV_DONE;
-               Print(label, " CONFIRMED (same bar) | Lot=", lots, " SL=", sl, " Risk$=", InpRiskPerTrade, " TP=", tp);
             }
          }
       }
@@ -526,7 +557,6 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
    else if(lv.state == LV_WAIT_CONFIRM)
    {
       lv.waitBars++;
-      lv.clusterHigh = MathMax(lv.clusterHigh, barHigh);
 
       if(HasBearishConfirm(1))
       {
@@ -539,14 +569,11 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
          if(risk > 0 && OpenSell(sl, tp, lots, label, lv.ticket))
          {
             lv.state = LV_DONE;
-            Print(label, " CONFIRMED (bar ", lv.waitBars, ") | Lot=", lots, " SL=", sl, " Risk$=", InpRiskPerTrade, " TP=", tp);
          }
       }
       else if(lv.waitBars >= InpMaxWaitBars)
       {
-         Print(label, " confirmation timeout after ", lv.waitBars, " bars. Reset touch.");
          lv.state = LV_WAIT_TOUCH;
-         lv.clusterHigh = 0;
       }
    }
 }
@@ -556,11 +583,11 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   g_hEMA34  = iMA(_Symbol, PERIOD_CURRENT, InpPeriodFast, 0, MODE_EMA, PRICE_CLOSE);
-   g_hEMA89  = iMA(_Symbol, PERIOD_CURRENT, InpPeriodMid,  0, MODE_EMA, PRICE_CLOSE);
-   g_hEMA200 = iMA(_Symbol, PERIOD_CURRENT, InpPeriodSlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_hEMA_Fast = iMA(_Symbol, PERIOD_CURRENT, InpPeriodFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_hEMA_Mid  = iMA(_Symbol, PERIOD_CURRENT, InpPeriodMid,  0, MODE_EMA, PRICE_CLOSE);
+   g_hEMA_Slow = iMA(_Symbol, PERIOD_CURRENT, InpPeriodSlow, 0, MODE_EMA, PRICE_CLOSE);
 
-   if(g_hEMA34 == INVALID_HANDLE || g_hEMA89 == INVALID_HANDLE || g_hEMA200 == INVALID_HANDLE)
+   if(g_hEMA_Fast == INVALID_HANDLE || g_hEMA_Mid == INVALID_HANDLE || g_hEMA_Slow == INVALID_HANDLE)
    {
       Print("ERROR: Cannot create EMA indicators!");
       return INIT_FAILED;
@@ -571,7 +598,6 @@ int OnInit()
    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
 
    ResetState();
-   Print("EMA Pullback EA v2.0 (Price Action) initialized on ", _Symbol);
    return INIT_SUCCEEDED;
 }
 
@@ -580,11 +606,10 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(g_hEMA34  != INVALID_HANDLE) IndicatorRelease(g_hEMA34);
-   if(g_hEMA89  != INVALID_HANDLE) IndicatorRelease(g_hEMA89);
-   if(g_hEMA200 != INVALID_HANDLE) IndicatorRelease(g_hEMA200);
+   if(g_hEMA_Fast != INVALID_HANDLE) IndicatorRelease(g_hEMA_Fast);
+   if(g_hEMA_Mid  != INVALID_HANDLE) IndicatorRelease(g_hEMA_Mid);
+   if(g_hEMA_Slow != INVALID_HANDLE) IndicatorRelease(g_hEMA_Slow);
    Comment("");
-   Print("EMA Pullback EA removed");
 }
 
 //+------------------------------------------------------------------+
@@ -593,17 +618,17 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    //--- Get EMA values (bar[0] and bar[1])
-   double ema34[2], ema89[2], ema200[2];
-   if(CopyBuffer(g_hEMA34,  0, 0, 2, ema34)  < 2) return;
-   if(CopyBuffer(g_hEMA89,  0, 0, 2, ema89)  < 2) return;
-   if(CopyBuffer(g_hEMA200, 0, 0, 2, ema200) < 2) return;
-   ArraySetAsSeries(ema34,  true);
-   ArraySetAsSeries(ema89,  true);
-   ArraySetAsSeries(ema200, true);
+   double emaFast[2], emaMid[2], emaSlow[2];
+   if(CopyBuffer(g_hEMA_Fast,  0, 0, 2, emaFast)  < 2) return;
+   if(CopyBuffer(g_hEMA_Mid,   0, 0, 2, emaMid)   < 2) return;
+   if(CopyBuffer(g_hEMA_Slow,  0, 0, 2, emaSlow)  < 2) return;
+   ArraySetAsSeries(emaFast,  true);
+   ArraySetAsSeries(emaMid,   true);
+   ArraySetAsSeries(emaSlow,  true);
 
    //--- Monitor individual closures and log to CSV immediately
    bool tpTriggered = false;
-   ulong tickets[3] = {g_lv34.ticket, g_lv89.ticket, g_lv200.ticket};
+   ulong tickets[3] = {g_lvFast.ticket, g_lvMid.ticket, g_lvSlow.ticket};
    
    for(int i = 0; i < 3; i++)
    {
@@ -612,31 +637,28 @@ void OnTick()
       int closureState = GetPositionClosureState(tickets[i]);
       if(closureState > 0)
       {
-         Print(">>> Position #", tickets[i], " closed. Recording to CSV... <<<");
          ExportTradeToCSV(tickets[i]);
          
          if(closureState == 1) tpTriggered = true; // Was a TP
 
          // Clear the ticket so we don't process it again
-         if(i == 0) g_lv34.ticket  = 0;
-         if(i == 1) g_lv89.ticket  = 0;
-         if(i == 2) g_lv200.ticket = 0;
+         if(i == 0) g_lvFast.ticket = 0;
+         if(i == 1) g_lvMid.ticket  = 0;
+         if(i == 2) g_lvSlow.ticket = 0;
       }
    }
 
    //--- If any position hit TP, close all remaining and reset cycle
    if(tpTriggered)
    {
-      Print(">>> TP detected! Closing all remaining positions <<<");
       CloseAllPositions();
-      ResetState();
+      g_setupValid = false; // Ngăn chặn mở thêm lệnh mới cho chu kỳ này để chờ các lệnh đóng hết và ghi log xong
       return;
    }
 
    //--- If all positions are gone (e.g. all hit SL), reset state
-   if((g_lv34.state == LV_DONE || g_lv89.state == LV_DONE || g_lv200.state == LV_DONE) && AllPositionsClosed())
+   if((g_lvFast.state == LV_DONE || g_lvMid.state == LV_DONE || g_lvSlow.state == LV_DONE) && AllPositionsClosed())
    {
-      Print(">>> All positions closed (SL or Manual). Resetting state... <<<");
       ResetState();
       return;
    }
@@ -645,7 +667,7 @@ void OnTick()
    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
    if(currentBarTime == g_lastBarTime) 
    {
-      DisplayInfo(ema34[0], ema89[0], ema200[0]);
+      DisplayInfo(emaFast[0], emaMid[0], emaSlow[0]);
       return;  // All logic below runs once per bar
    }
    g_lastBarTime = currentBarTime;
@@ -655,87 +677,82 @@ void OnTick()
    {
       double prevClose = iClose(_Symbol, PERIOD_CURRENT, 1);
 
-      if(prevClose > ema34[1] && prevClose > ema89[1] && prevClose > ema200[1]
-         && ema34[1] > ema89[1] && ema89[1] > ema200[1])
+      if(prevClose > emaFast[1] && prevClose > emaMid[1] && prevClose > emaSlow[1]
+         && emaFast[1] > emaMid[1] && emaMid[1] > emaSlow[1])
       {
          g_direction  = DIR_BUY;
          g_setupValid = true;
-         Print("*** BULLISH setup | EMA34=", ema34[1], " EMA89=", ema89[1],
-               " EMA200=", ema200[1], " Close=", prevClose, " ***");
       }
-      else if(prevClose < ema34[1] && prevClose < ema89[1] && prevClose < ema200[1]
-              && ema34[1] < ema89[1] && ema89[1] < ema200[1])
+      else if(prevClose < emaFast[1] && prevClose < emaMid[1] && prevClose < emaSlow[1]
+              && emaFast[1] < emaMid[1] && emaMid[1] < emaSlow[1])
       {
          g_direction  = DIR_SELL;
          g_setupValid = true;
-         Print("*** BEARISH setup | EMA34=", ema34[1], " EMA89=", ema89[1],
-               " EMA200=", ema200[1], " Close=", prevClose, " ***");
       }
    }
    else
    {
-      // Invalidate if EMA alignment broken and no entries taken
-      bool noEntries = (g_lv34.state != LV_DONE && g_lv89.state != LV_DONE && g_lv200.state != LV_DONE);
-      if(noEntries)
+      // Check EMA alignment — invalidate setup if alignment broken
+      bool alignmentBroken = false;
+      if(g_direction == DIR_BUY && !(emaFast[0] > emaMid[0] && emaMid[0] > emaSlow[0]))
+         alignmentBroken = true;
+      if(g_direction == DIR_SELL && !(emaFast[0] < emaMid[0] && emaMid[0] < emaSlow[0]))
+         alignmentBroken = true;
+
+      if(alignmentBroken)
       {
-         if(g_direction == DIR_BUY && !(ema34[0] > ema89[0] && ema89[0] > ema200[0]))
-         { Print("Bullish alignment broken. Reset."); ResetState(); return; }
-         if(g_direction == DIR_SELL && !(ema34[0] < ema89[0] && ema89[0] < ema200[0]))
-         { Print("Bearish alignment broken. Reset."); ResetState(); return; }
+         bool noEntries = (g_lvFast.state != LV_DONE && g_lvMid.state != LV_DONE && g_lvSlow.state != LV_DONE);
+         if(noEntries)
+         {
+            ResetState();
+            return;
+         }
+         else
+         {
+            g_setupValid = false;
+         }
       }
    }
 
-   //--- Process entry levels (sequential: 34 must be done/skipped before 89, etc.)
-   if(!g_setupValid) { DisplayInfo(ema34[0], ema89[0], ema200[0]); return; }
+   //--- Process entry levels (independent per EMA)
+   if(!g_setupValid) { DisplayInfo(emaFast[0], emaMid[0], emaSlow[0]); return; }
 
    if(g_direction == DIR_BUY)
    {
-      // Level 34: SL at EMA89
-      if(InpUseEMA34 && g_lv34.state != LV_DONE)
-         ProcessBuyLevel(g_lv34, ema34[1], ema89[1], 1.0, "EMA34_BUY");
-      else if(!InpUseEMA34)
-         g_lv34.state = LV_DONE;
+      // Fast Level: SL at Slow EMA
+      if(InpUseEMA_Fast && g_lvFast.state != LV_DONE)
+         ProcessBuyLevel(g_lvFast, emaFast[1], emaSlow[1], InpRR_Fast, "EMA" + IntegerToString(InpPeriodFast) + "_BUY");
 
-      // Level 89: SL at EMA200
-      if(InpUseEMA89 && g_lv34.state == LV_DONE && g_lv89.state != LV_DONE)
-         ProcessBuyLevel(g_lv89, ema89[1], ema200[1], 2.0, "EMA89_BUY");
-      else if(!InpUseEMA89)
-         g_lv89.state = LV_DONE;
+      // Mid Level: SL at Slow EMA (independent entry)
+      if(InpUseEMA_Mid && g_lvMid.state != LV_DONE)
+         ProcessBuyLevel(g_lvMid, emaMid[1], emaSlow[1], InpRR_Mid, "EMA" + IntegerToString(InpPeriodMid) + "_BUY");
 
-      // Level 200: SL at Cluster Low
-      if(InpUseEMA200 && g_lv89.state == LV_DONE && g_lv200.state != LV_DONE)
+      // Slow Level: SL at confirmation candle low
+      if(InpUseEMA_Slow && g_lvSlow.state != LV_DONE)
       {
-         double sl = (g_lv200.clusterLow != DBL_MAX) ? g_lv200.clusterLow : iLow(_Symbol, PERIOD_CURRENT, 1);
-         ProcessBuyLevel(g_lv200, ema200[1], sl - InpSL_Buffer, 3.0, "EMA200_BUY");
+         double slPrice = iLow(_Symbol, PERIOD_CURRENT, 1);
+         ProcessBuyLevel(g_lvSlow, emaSlow[1], slPrice, InpRR_Slow, "EMA" + IntegerToString(InpPeriodSlow) + "_BUY");
       }
-      else if(!InpUseEMA200)
-         g_lv200.state = LV_DONE;
    }
    else if(g_direction == DIR_SELL)
    {
-      // Level 34: SL at EMA89
-      if(InpUseEMA34 && g_lv34.state != LV_DONE)
-         ProcessSellLevel(g_lv34, ema34[1], ema89[1], 1.0, "EMA34_SELL");
-      else if(!InpUseEMA34)
-         g_lv34.state = LV_DONE;
+      // Fast Level: SL at Slow EMA
+      if(InpUseEMA_Fast && g_lvFast.state != LV_DONE)
+         ProcessSellLevel(g_lvFast, emaFast[1], emaSlow[1], InpRR_Fast, "EMA" + IntegerToString(InpPeriodFast) + "_SELL");
 
-      // Level 89: SL at EMA200
-      if(InpUseEMA89 && g_lv34.state == LV_DONE && g_lv89.state != LV_DONE)
-         ProcessSellLevel(g_lv89, ema89[1], ema200[1], 2.0, "EMA89_SELL");
-      else if(!InpUseEMA89)
-         g_lv89.state = LV_DONE;
+      // Mid Level: SL at Slow EMA (independent entry)
+      if(InpUseEMA_Mid && g_lvMid.state != LV_DONE)
+         ProcessSellLevel(g_lvMid, emaMid[1], emaSlow[1], InpRR_Mid, "EMA" + IntegerToString(InpPeriodMid) + "_SELL");
 
-      // Level 200: SL at Cluster High
-      if(InpUseEMA200 && g_lv89.state == LV_DONE && g_lv200.state != LV_DONE)
+      // Slow Level: SL at confirmation candle high
+      if(InpUseEMA_Slow && g_lvSlow.state != LV_DONE)
       {
-         double sl = (g_lv200.clusterHigh != 0) ? g_lv200.clusterHigh : iHigh(_Symbol, PERIOD_CURRENT, 1);
-         ProcessSellLevel(g_lv200, ema200[1], sl + InpSL_Buffer, 3.0, "EMA200_SELL");
+         double slPrice = iHigh(_Symbol, PERIOD_CURRENT, 1);
+         ProcessSellLevel(g_lvSlow, emaSlow[1], slPrice, InpRR_Slow, "EMA" + IntegerToString(InpPeriodSlow) + "_SELL");
       }
-      else if(!InpUseEMA200)
-         g_lv200.state = LV_DONE;
    }
 
-   DisplayInfo(ema34[0], ema89[0], ema200[0]);
+   DisplayInfo(emaFast[0], emaMid[0], emaSlow[0]);
 }
 
 //+------------------------------------------------------------------+
@@ -752,23 +769,22 @@ string StateStr(SLevel &lv)
 //+------------------------------------------------------------------+
 //| Display info on chart                                             |
 //+------------------------------------------------------------------+
-void DisplayInfo(double ema34, double ema89, double ema200)
+void DisplayInfo(double emaFast, double emaMid, double emaSlow)
 {
    string dirStr = "NONE";
    if(g_direction == DIR_BUY)  dirStr = "BUY (Bullish)";
    if(g_direction == DIR_SELL) dirStr = "SELL (Bearish)";
 
    string info = "";
-   info += "══════ EMA Pullback EA v2.0 ══════\n";
+   info += "══════ EMA Pullback EA v3.0 ══════\n";
    info += "Mode: Price Action Confirmation\n";
    info += "Direction: " + dirStr + "\n";
    info += "─────────────────────────────\n";
-   info += "EMA34:  " + DoubleToString(ema34,  _Digits) + " | " + StateStr(g_lv34)  + "\n";
-   info += "EMA89:  " + DoubleToString(ema89,  _Digits) + " | " + StateStr(g_lv89)  + "\n";
-   info += "EMA200: " + DoubleToString(ema200, _Digits) + " | " + StateStr(g_lv200) + "\n";
+   info += "EMA" + IntegerToString(InpPeriodFast) + ":  " + DoubleToString(emaFast, _Digits) + " | " + StateStr(g_lvFast)  + "\n";
+   info += "EMA" + IntegerToString(InpPeriodMid) + ":  " + DoubleToString(emaMid,  _Digits) + " | " + StateStr(g_lvMid)   + "\n";
+   info += "EMA" + IntegerToString(InpPeriodSlow) + ": " + DoubleToString(emaSlow, _Digits) + " | " + StateStr(g_lvSlow)  + "\n";
    info += "─────────────────────────────\n";
    info += "Open Positions: " + IntegerToString(CountPositions()) + " / 3\n";
-   info += "SL Buffer: $" + DoubleToString(InpSL_Buffer, 1) + "\n";
 
    Comment(info);
 }
