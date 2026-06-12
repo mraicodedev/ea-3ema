@@ -35,7 +35,12 @@ input group "=== Pattern Detection ==="
 input double           InpPinbarRatio    = 2.0;             // Pinbar: wick/body minimum ratio
 input double           InpMinCandleRange = 1.0;             // Min candle range to qualify (price $)
 
-
+input group "=== RSI Filter ==="
+input bool             InpUseRSIFilter   = true;            // Enable RSI Filter
+input int              InpRSIPeriod      = 14;              // RSI Period
+input int              InpRSITrendBars   = 3;               // Bars for RSI trend check (3-5)
+input double           InpRSILowerBound  = 45.0;            // RSI No-Trade Zone Lower Bound
+input double           InpRSIUpperBound  = 55.0;            // RSI No-Trade Zone Upper Bound
 
 input group "=== Trading Days ==="
 input bool             InpTradeMonday    = true;            // Trade on Monday
@@ -75,7 +80,7 @@ struct SLevel
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
-int g_hEMA_Fast, g_hEMA_Mid, g_hEMA_Slow;
+int g_hEMA_Fast, g_hEMA_Mid, g_hEMA_Slow, g_hRSI;
 CTrade g_trade;
 
 ENUM_DIR g_direction = DIR_NONE;
@@ -466,6 +471,47 @@ bool AllPositionsClosed()
 }
 
 //+------------------------------------------------------------------+
+//| Check RSI Condition                                               |
+//+------------------------------------------------------------------+
+bool CheckRSIFilter(int direction)
+{
+   if(!InpUseRSIFilter) return true;
+
+   double rsi[];
+   ArraySetAsSeries(rsi, true);
+   
+   // Need InpRSITrendBars + 1 elements (from index 1 to InpRSITrendBars)
+   int count = InpRSITrendBars + 1;
+   if(CopyBuffer(g_hRSI, 0, 1, count, rsi) < count)
+   {
+      Print("WARNING: RSI Buffer copy failed!");
+      return false;
+   }
+   
+   // RSI cannot be in the no-trade zone
+   if(rsi[0] >= InpRSILowerBound && rsi[0] <= InpRSIUpperBound) return false;
+   
+   if(direction == DIR_BUY)
+   {
+      // Trend check: RSI[1] > RSI[2] > RSI[3] -> rsi[0] > rsi[1] > rsi[2]
+      for(int i = 0; i < InpRSITrendBars - 1; i++)
+      {
+         if(rsi[i] <= rsi[i+1]) return false; 
+      }
+   }
+   else if(direction == DIR_SELL)
+   {
+      // Trend check: RSI[1] < RSI[2] < RSI[3] -> rsi[0] < rsi[1] < rsi[2]
+      for(int i = 0; i < InpRSITrendBars - 1; i++)
+      {
+         if(rsi[i] >= rsi[i+1]) return false;
+      }
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Process a single level for BUY direction (called on new bar)      |
 //| emaVal = EMA value to touch, slPrice = price for SL,              |
 //| rrMultiple = R:R ratio, label = comment                           |
@@ -484,7 +530,7 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
          lv.state    = LV_WAIT_CONFIRM;
          lv.waitBars = 0;
 
-         if(HasBullishConfirm(1))
+         if(HasBullishConfirm(1) && CheckRSIFilter(DIR_BUY))
          {
             double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             double sl   = NP(slPrice);
@@ -503,7 +549,7 @@ void ProcessBuyLevel(SLevel &lv, double emaVal, double slPrice, double rrMultipl
    {
       lv.waitBars++;
 
-      if(HasBullishConfirm(1))
+      if(HasBullishConfirm(1) && CheckRSIFilter(DIR_BUY))
       {
          double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          double sl   = NP(slPrice);
@@ -540,7 +586,7 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
          lv.state    = LV_WAIT_CONFIRM;
          lv.waitBars = 0;
 
-         if(HasBearishConfirm(1))
+         if(HasBearishConfirm(1) && CheckRSIFilter(DIR_SELL))
          {
             double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
             double sl   = NP(slPrice);
@@ -559,7 +605,7 @@ void ProcessSellLevel(SLevel &lv, double emaVal, double slPrice, double rrMultip
    {
       lv.waitBars++;
 
-      if(HasBearishConfirm(1))
+      if(HasBearishConfirm(1) && CheckRSIFilter(DIR_SELL))
       {
          double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          double sl   = NP(slPrice);
@@ -587,10 +633,11 @@ int OnInit()
    g_hEMA_Fast = iMA(_Symbol, PERIOD_CURRENT, InpPeriodFast, 0, MODE_EMA, PRICE_CLOSE);
    g_hEMA_Mid  = iMA(_Symbol, PERIOD_CURRENT, InpPeriodMid,  0, MODE_EMA, PRICE_CLOSE);
    g_hEMA_Slow = iMA(_Symbol, PERIOD_CURRENT, InpPeriodSlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_hRSI      = iRSI(_Symbol, PERIOD_CURRENT, InpRSIPeriod, PRICE_CLOSE);
 
-   if(g_hEMA_Fast == INVALID_HANDLE || g_hEMA_Mid == INVALID_HANDLE || g_hEMA_Slow == INVALID_HANDLE)
+   if(g_hEMA_Fast == INVALID_HANDLE || g_hEMA_Mid == INVALID_HANDLE || g_hEMA_Slow == INVALID_HANDLE || g_hRSI == INVALID_HANDLE)
    {
-      Print("ERROR: Cannot create EMA indicators!");
+      Print("ERROR: Cannot create indicators!");
       return INIT_FAILED;
    }
 
@@ -615,6 +662,7 @@ void OnDeinit(const int reason)
    if(g_hEMA_Fast != INVALID_HANDLE) IndicatorRelease(g_hEMA_Fast);
    if(g_hEMA_Mid  != INVALID_HANDLE) IndicatorRelease(g_hEMA_Mid);
    if(g_hEMA_Slow != INVALID_HANDLE) IndicatorRelease(g_hEMA_Slow);
+   if(g_hRSI      != INVALID_HANDLE) IndicatorRelease(g_hRSI);
    Comment("");
 }
 
