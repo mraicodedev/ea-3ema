@@ -427,6 +427,9 @@ int GetPositionClosureState(ulong ticket)
    if(ticket == 0) return 0;
    if(PositionExists(ticket)) return 0;
 
+   // Lệnh có thể vẫn đang pending hoặc chưa kịp xử lý
+   if(OrderSelect(ticket)) return 0;
+
    // Position is closed - check history for reason
    if(HistorySelectByPosition(ticket))
    {
@@ -442,8 +445,21 @@ int GetPositionClosureState(ulong ticket)
                return 2; // Other (SL, Manual, etc.)
          }
       }
+      return 2; // Tìm thấy history nhưng chưa load đủ deal out (hiếm), coi như đóng
    }
-   return 2; // Closed but reason not found
+   
+   // Kiểm tra order history xem lệnh có bị từ chối không
+   if(HistoryOrderSelect(ticket))
+   {
+      long state = HistoryOrderGetInteger(ticket, ORDER_STATE);
+      if(state == ORDER_STATE_REJECTED || state == ORDER_STATE_CANCELED || state == ORDER_STATE_EXPIRED)
+      {
+         return 2; // Lệnh lỗi/hủy
+      }
+   }
+
+   // Chưa tìm thấy ở active position và history -> đang đồng bộ (Race Condition)
+   return 0;
 }
 
 //+------------------------------------------------------------------+
@@ -454,10 +470,10 @@ bool AllPositionsClosed()
    bool anyEntry = (g_lvFast.state == LV_DONE || g_lvMid.state == LV_DONE || g_lvSlow.state == LV_DONE);
    if(!anyEntry) return false;
 
-   // Check if any entered position is still active
-   if(g_lvFast.state == LV_DONE && PositionExists(g_lvFast.ticket)) return false;
-   if(g_lvMid.state == LV_DONE && PositionExists(g_lvMid.ticket)) return false;
-   if(g_lvSlow.state == LV_DONE && PositionExists(g_lvSlow.ticket)) return false;
+   // Check if any entered position is still active (ticket chưa bị xóa bởi GetPositionClosureState)
+   if(g_lvFast.state == LV_DONE && g_lvFast.ticket > 0) return false;
+   if(g_lvMid.state == LV_DONE && g_lvMid.ticket > 0) return false;
+   if(g_lvSlow.state == LV_DONE && g_lvSlow.ticket > 0) return false;
 
    // If setup invalid (e.g. EMA alignment broken), reset when all entered positions closed
    if(!g_setupValid) return true;
